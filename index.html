@@ -111,6 +111,36 @@
   .dot {
     position: fixed; z-index: 1;
   }
+
+  button.secondary {
+    appearance: none; cursor: pointer;
+    padding: 10px 20px;
+    border-radius: 999px;
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--ink-0);
+    font-size: 0.85rem; font-weight: 600;
+    font-family: -apple-system, system-ui, sans-serif;
+  }
+  button.secondary:active { transform: scale(0.97); }
+
+  #ar-quicklook {
+    display: none;
+  }
+
+  #ios-note {
+    display: none;
+    font-size: 0.78rem;
+    color: var(--ink-1);
+    font-family: -apple-system, system-ui, sans-serif;
+    max-width: 42ch;
+    line-height: 1.4;
+  }
+  #ios-note code {
+    background: var(--line);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
 </style>
 </head>
 <body>
@@ -127,9 +157,20 @@
 
 <div id="panel">
   <div class="msg" id="msg">Carregando o visualizador…</div>
+
+  <!-- Link de AR Quick Look do iPhone: só funciona quando existir um hamburguer.usdz real no mesmo diretório -->
+  <a id="ar-quicklook" rel="ar" href="hamburguer.usdz">
+    <img id="ar-quicklook-img" src="" alt="Ver em AR" width="1" height="1" />
+  </a>
+  <div class="msg" id="ios-note">
+    Para AR real no iPhone, gere um arquivo <code>hamburguer.usdz</code> a partir do .glb abaixo (Reality Converter ou um conversor online) e coloque-o na mesma pasta deste HTML.
+  </div>
+
   <button class="cta" id="main-btn" disabled>Aguarde…</button>
+  <button class="secondary" id="download-glb">Baixar modelo 3D (.glb)</button>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script type="importmap">
 {
   "imports": {
@@ -143,12 +184,27 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 
 const app = document.getElementById('app');
 const msg = document.getElementById('msg');
 const mainBtn = document.getElementById('main-btn');
 const resetBtn = document.getElementById('reset-btn');
 const hint = document.getElementById('hint');
+const downloadBtn = document.getElementById('download-glb');
+const arQuickLook = document.getElementById('ar-quicklook');
+const arQuickLookImg = document.getElementById('ar-quicklook-img');
+const iosNote = document.getElementById('ios-note');
+
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+
+let downloadsAPI = null;
+(async () => {
+  downloadsAPI = await (window.claude && window.claude.use ? window.claude.use('downloads') : Promise.resolve(null));
+  if (!downloadsAPI) {
+    downloadBtn.style.display = 'none';
+  }
+})();
 
 // ---------- Renderer / Scene / Camera ----------
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -402,17 +458,80 @@ function setupAR() {
   });
 }
 
+// ---------- Export model as downloadable .glb (zipped — .glb sozinho não é aceito pelo downloads) ----------
+async function exportModelAsGLB(model) {
+  if (!downloadsAPI) return;
+
+  downloadBtn.disabled = true;
+  downloadBtn.textContent = 'Gerando arquivo…';
+
+  const exporter = new GLTFExporter();
+
+  exporter.parse(
+    model,
+    async (result) => {
+      try {
+        const zip = new JSZip();
+        zip.file('hamburguer.glb', result); // result já é um ArrayBuffer
+        const zipBlob = await zip.generateAsync({ type: 'blob' });
+
+        const res = await downloadsAPI.save({
+          filename: 'hamburguer-3d.zip',
+          data: zipBlob
+        });
+
+        downloadBtn.textContent = res.status === 'saved' ? 'Baixado! (.zip com o .glb)' : 'Baixar modelo 3D (.glb)';
+      } catch (err) {
+        if (err && err.code === 'declined') {
+          downloadBtn.textContent = 'Baixar modelo 3D (.glb)';
+        } else {
+          console.error('Erro ao salvar:', err);
+          downloadBtn.textContent = 'Erro — tente de novo';
+        }
+      } finally {
+        downloadBtn.disabled = false;
+        setTimeout(() => { downloadBtn.textContent = 'Baixar modelo 3D (.glb)'; }, 3000);
+      }
+    },
+    (error) => {
+      console.error('Erro ao exportar GLB:', error);
+      downloadBtn.disabled = false;
+      downloadBtn.textContent = 'Erro ao exportar';
+    },
+    { binary: true }
+  );
+}
+
 // ---------- Decide AR vs preview ----------
 async function init() {
   const supportsAR = navigator.xr && await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
 
+  let exportSource; // model used for the .glb download button
+
   if (supportsAR) {
     setupAR();
-  } else {
-    msg.innerHTML = 'Este navegador não suporta AR na web (comum em iPhones e em navegadores de desktop). Veja o modelo abaixo — arraste para girar. O prato branco tem <b>18 cm de diâmetro</b> e a régua mostra centímetros reais.';
+    exportSource = buildBurger(); // clean copy, not attached to the live AR scene
+  } else if (isIOS) {
+    msg.innerHTML = 'O Safari do iPhone não suporta AR na web. Toque abaixo para tentar o <b>AR Quick Look</b> nativo da Apple (só funciona depois que um <code>hamburguer.usdz</code> real estiver na mesma pasta deste arquivo). Enquanto isso, veja o modelo em 3D comum.';
     mainBtn.style.display = 'none';
     setupPreview();
+    exportSource = previewBurger;
+
+    // Prepare the Quick Look link with a snapshot thumbnail
+    requestAnimationFrame(() => {
+      renderer.render(scene, camera);
+      arQuickLookImg.src = renderer.domElement.toDataURL('image/png');
+      arQuickLook.style.display = 'inline-block';
+      iosNote.style.display = 'block';
+    });
+  } else {
+    msg.innerHTML = 'Este navegador não suporta AR na web. Veja o modelo abaixo — arraste para girar. O prato branco tem <b>18 cm de diâmetro</b> e a régua mostra centímetros reais.';
+    mainBtn.style.display = 'none';
+    setupPreview();
+    exportSource = previewBurger;
   }
+
+  downloadBtn.addEventListener('click', () => exportModelAsGLB(exportSource));
 }
 
 init();
